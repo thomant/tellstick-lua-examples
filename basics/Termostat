@@ -1,0 +1,166 @@
+-- File: termostat.lua
+---------------------------------------------------------
+-- Execute one or more separet termostats
+-- Each termostate uses a dummy dimmer control for temperature setting,
+-- it controls one switch and gets its temperature from one termometer.
+-- It's all setup in onInit()
+-- The dimmer setting is converterd as:
+--- 0% - Termostat OFF
+--- 25% - 10 deg C
+--- 50% - 20 deg C
+--- 75% - 21 deg C
+--- 100 - 22 deg C
+-- Another dummy switch controls console printout. Name should be "Lua Console Print".
+---------------------------------------------------------
+-- 17-10-15 AnT c
+
+local deviceManager = require "telldus.DeviceManager"
+
+local consolePrintSwitch = deviceManager:findByName("Lua Console Print")
+if (consolePrintSwitch == nil) then 
+	print("'Lua Console Print' dummy switch can't be fund")
+end
+
+function conPr(...)
+	--- Console print if dummy device "Lua Console Print" is not off
+	if (consolePrintSwitch:state() == 2) then return end --- 2 is off, 1 is on, 16 = dim
+	print(...)
+end
+
+local termostats = {}
+
+function addTermostat(name, switchName, controlName, termometerName)
+	local switch = deviceManager:findByName(switchName) 
+	if (switch == nil) then
+		print("Switch '%s' not found", switchName)
+		return
+	end
+	
+	local control = deviceManager:findByName(controlName)
+	if (control == nil) then
+		print("Control '%s' not found", controlName)
+		return
+	end
+
+	local termometer = deviceManager:findByName(termometerName) 
+	if (termometer == nil) then 
+		print("Termometer '%s' not found", termometerName)
+		return 
+	end
+
+	termostats[switchName] = {
+		name = name,
+		switch = switch, 
+		control = control, 
+		termometer = termometer,
+		checkTime = os.time() - 60,
+		switchTime = os.time(),
+		switchTemp = nil
+	}
+end		
+
+	
+function doTermostat(self, callerLabel)
+	-- Check if temperature value is above or
+	-- below the value implied by the dummy control device. 
+	-- If below, turn on heater switch,
+	-- if above turn off. 
+	
+	local t = os.time()
+	if (os.difftime(t, self.checkTime) < 3) then return end
+	self.checkTime = t
+
+	local hysteres = 0.1
+	
+	conPr("------------------------------------------------------------------")
+	conPr("%s update on termostat '%s' at %s", callerLabel, self.name, os.date("%y-%m-%d %H:%M:%S", os.time()))
+
+	local state, controlTempValue = self.control:state()
+	-- state 16=dim, 1=on, 2=off
+	-- value 0-255 at dim or else nil
+	if (state ~= 16) then 
+		if (state == 1) then controlTempValue = 256 else controlTempValue = 0 end
+	end
+	local tempLimit
+	if (controlTempValue > 127) then 
+			tempLimit = (controlTempValue / 64) + 18 -- 50% = 20 deg C, 75% = 21 deg C, 100% = 22 deg C
+		else
+			tempLimit = controlTempValue / 6.4 -- 0% = off, 25% = 10 deg C
+	end
+	
+	if (tempLimit == 0) then
+		conPr("Termostat is set to OFF")
+	else
+		conPr("Termostat is set to %g degrees", tempLimit)
+	end
+	
+	local currState = self.switch:state()
+	
+	if (currState == 1) then --- heater on
+		conPr("Heater is currently ON")
+		tempLimit = tempLimit + hysteres
+	else
+		conPr("Heater is currently OFF")
+		tempLimit = tempLimit - hysteres
+	end
+
+	local temp = self.termometer:sensorValue(1, 0)
+	if (temp == nil) then conPr("Temperature not available yet"); return end
+	if (self.switchTemp == nil) then self.switchTemp = temp end
+	local diffTemp = temp - self.switchTemp --- Diff sinse last turn on/off
+	local diffTime = os.difftime(self.checkTime, self.switchTime) / 60
+		
+	if ((controlTempValue == 0) or (temp >= tempLimit)) then
+		if (controlTempValue == 0) then
+			conPr("Current temp: %g (%g degrees in %i minutes)", temp, diffTemp, diffTime)
+		else
+			conPr("Current temp: %g >= limit: %g (%g degrees in %i minutes)", temp, tempLimit, diffTemp, diffTime)
+		end
+		if (currState == 1) then 
+			self.switch:command("turnoff", nil, "Lua termostat")
+			conPr("TURN OFF")
+			self.switchTime = self.checkTime
+			self.switchTemp = temp
+		end
+	else
+		conPr("Current temp: %g < limit: %g (%g degrees in %i minutes)", temp, tempLimit, diffTemp, diffTime)
+		if (currState ~= 1) then 
+			self.switch:command("turnon", nil, "Lua termostat")
+			conPr("TURN ON")
+			self.switchTime = self.checkTime
+			self.switchTemp = temp
+		end
+	end
+end
+
+
+function onDeviceStateChanged(device, state, stateValue)
+	local termostat
+	for d, termostat in pairs(termostats) do
+		if (device:name() == termostat.control:name()) then
+			doTermostat(termostat, "Control")
+		end
+	end
+end
+
+
+function onSensorValueUpdated(device, valueType, value, scale)
+	if (valueType ~= 1) then return end --- not temperature
+	for d, termostat in pairs(termostats) do
+		if (device:name() == termostat.termometer:name()) then
+			doTermostat(termostat, "Termometer")
+		end
+	end
+end
+
+
+function onInit()
+	--- (name, switchName, controlName, termometerName)
+	addTermostat("Kök", "13 ElemKök", "00 TempKök", "1 Köket (0)")
+	addTermostat("Mellanrum", "37 ElemMell", "00 TempSov", "3 Sovrummet (+0,1)")
+	addTermostat("Sovrum", "39 ElemSov", "00 TempSov", "3 Sovrummet (+0,1)")
+
+	for d, termostat in pairs(termostats) do
+		doTermostat(termostat, "Initial")
+	end
+end
